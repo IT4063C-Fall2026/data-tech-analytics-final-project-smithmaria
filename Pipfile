@@ -8,6 +8,9 @@ ipykernel = "*"
 jupyter = "*"
 notebook = "*"
 black = "*"
+sqlalchemy = "*"
+psycopg2-binary = "*"
+python-dotenv = "*"
 
 [dev-packages]
 
