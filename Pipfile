@@ -11,6 +11,7 @@ black = "*"
 sqlalchemy = "*"
 psycopg2-binary = "*"
 python-dotenv = "*"
+scikit-learn = "*"
 
 [dev-packages]
 

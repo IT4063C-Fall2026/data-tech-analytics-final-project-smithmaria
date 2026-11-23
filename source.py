@@ -744,11 +744,269 @@ fig.show()
 # - The increase starts around 2016, the same time as the NIH sex as a biological variable policy, but this chart can't show that the policy caused it. 2022 also has fewer trials with posted results.
 # - The gaps in the first chart are condition-specific. Treatment trials overall are only a few points below 50%, while stroke, Alzheimer's, COPD, and ischemic heart disease are 11–17 points below their share of the burden.
 
+# ## Machine Learning Plan
+# 
+# **Model:** a regression model that predicts each trial's participation gap (in percentage points) from its characteristics, to find which kinds of trials are more likely to underenroll women.
+# 
+# **Features:** cause, start year, number of participants, share of US sites, phase, number of arms, lead sponsor type, eligibility sex and age limits, allocation, and masking. Linear regression, a decision tree, and a random forest are compared using cross-validated RMSE, and the best one is tuned with a grid search.
+# 
+# **Challenges:**
+# - Small trials can have extreme shares (a 10-person trial can be 0% or 100% women), so trials with fewer than 20 participants are dropped.
+# - Some causes have far fewer trials than others, so the train/test split is stratified by cause.
+# - Phase and allocation are "NA" for trials they don't apply to, so "NA" is kept as its own category.
+# - About half of trials have no upper age limit, so a missing max age is filled with 100 instead of the median.
+# - Cause, phase, sponsor type and other categories need to be one-hot encoded, and the numeric features are on very different scales.
+# - Only trials that posted sex counts can be used, and recent trials post less often. This is a limitation that can't be fixed.
+# - The model shows which trial characteristics are linked to larger gaps, not what causes them.
+
+# ## Machine Learning
+# 
+# ### Ask
+# Which trial characteristics are linked to women being underenrolled compared to their share of the condition? This is a regression problem. The target is each trial's gap in percentage points: the trial's female share minus the GBD female share of prevalence for that cause and start year. Negative means women are underenrolled.
+# 
+# ### Prep
+# More trial characteristics are pulled from AACT for the matched trials: phase, number of arms, lead sponsor type, eligibility sex and age limits, allocation (randomized or not), and masking (blinding). Each trial is then joined to the GBD prevalence share for its cause and start year.
+
+# In[ ]:
+
+
+trials = pd.read_csv("data/processed/trials_matched.csv")
+gbd = pd.read_csv("data/processed/gbd_clean.csv")
+ids = "', '".join(trials["nct_id"].unique())
+
+features_query = f"""
+SELECT s.nct_id, s.phase, s.number_of_arms, sp.agency_class, e.gender,
+       e.minimum_age, e.maximum_age, d.allocation, d.masking
+FROM studies s
+LEFT JOIN sponsors sp ON sp.nct_id = s.nct_id AND sp.lead_or_collaborator = 'lead'
+LEFT JOIN eligibilities e ON e.nct_id = s.nct_id
+LEFT JOIN designs d ON d.nct_id = s.nct_id
+WHERE s.nct_id IN ('{ids}')
+"""
+with engine.connect() as conn:
+    features = pd.read_sql(text(features_query), conn)
+
+prevalence = gbd[gbd["measure_name"] == "Prevalence"][["cause_name", "year", "female_share"]]
+prevalence = prevalence.rename(columns={"year": "start_year", "female_share": "prevalence_female_share"})
+
+ml = trials.merge(features, on="nct_id").merge(prevalence, on=["cause_name", "start_year"])
+ml["gap"] = (ml["female_share"] - ml["prevalence_female_share"]) * 100
+ml = ml.drop(columns=["Female", "Male", "female_share", "prevalence_female_share", "primary_purpose", "healthy_volunteers"])
+
+ml.to_csv("data/processed/ml_trials.csv", index=False)
+ml.info()
+
+
+# ### Process
+# #### EDA for machine learning
+
+# In[ ]:
+
+
+ml.isna().sum()
+
+
+# In[ ]:
+
+
+for col in ["phase", "agency_class", "gender", "allocation", "masking"]:
+    print(ml[col].value_counts(dropna=False), "\n")
+
+
+# In[ ]:
+
+
+ml.hist(figsize=(12, 7), bins=40)
+plt.tight_layout()
+plt.show()
+
+ml.select_dtypes("number").corr()["gap"]
+
+
+# In[ ]:
+
+
+for col in ["agency_class", "gender"]:
+    print(ml.groupby(col)["gap"].agg(["mean", "count"]).round(1), "\n")
+
+
+# - **"NA" values that aren't errors:** `phase` is "NA" for 1,450 trials because phases only apply to drug trials. `allocation` is "NA" for 1,090 trials because it only applies to trials with more than one arm. "NA" is kept as its own category, and the few truly missing values (4 and 17) are filled with "NA" too.
+# - **Missing max age:** `maximum_age` is missing for about half of the trials, which means they have no upper age limit. These are filled with 100. The median would wrongly give them an upper limit.
+# - **Wrong data type:** ages are text like "18 Years", so they are converted to numbers in years.
+# - **Outliers and skew:** `total` is very right-skewed (median 52, max 12,000). 1,200 trials have fewer than 20 participants, where a single person moves the share by 5 or more points, so they are dropped.
+# - **Weak correlations:** the gap is widely spread (standard deviation about 21 points). None of the numeric features correlate with it much (all under 0.1).
+# - **Categories that stand out:** federal sponsors (almost all the VA) average a gap of about −35 points, compared with −2 to −4 for other sponsor types. Women-only and men-only trials sit at the extremes by design.
+# - **Rare categories:** some categories are rare, like INDIV sponsors (5 trials) and EARLY_PHASE1 (30 trials).
+
+# In[ ]:
+
+
+import numpy as np
+
+def age_in_years(age):
+    if pd.isna(age):
+        return np.nan
+    number, unit = age.split()
+    if "Month" in unit:
+        return float(number) / 12
+    if "Day" in unit:
+        return float(number) / 365
+    return float(number)
+
+ml["minimum_age"] = ml["minimum_age"].apply(age_in_years)
+ml["maximum_age"] = ml["maximum_age"].apply(age_in_years).fillna(100)
+ml["phase"] = ml["phase"].fillna("NA")
+ml["allocation"] = ml["allocation"].fillna("NA")
+
+print(f"Dropping {(ml['total'] < 20).sum():,} trials with fewer than 20 participants")
+ml = ml[ml["total"] >= 20].reset_index(drop=True)
+print(f"{len(ml):,} rows left")
+
+
+# #### Train/test split
+# `StratifiedShuffleSplit` on cause keeps the same mix of causes in both sets, so the causes with fewer trials still show up in the test set. 80% of rows are used for training and 20% for testing.
+
+# In[ ]:
+
+
+from sklearn.model_selection import StratifiedShuffleSplit
+
+split = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+for train_index, test_index in split.split(ml, ml["cause_name"]):
+    train_set = ml.loc[train_index]
+    test_set = ml.loc[test_index]
+
+X_train = train_set.drop(columns=["nct_id", "gap"])
+y_train = train_set["gap"].copy()
+X_test = test_set.drop(columns=["nct_id", "gap"])
+y_test = test_set["gap"].copy()
+
+print(f"{len(X_train):,} training rows, {len(X_test):,} test rows")
+
+
+# #### Pipeline
+# - **Numeric features:** missing values are filled with the median (only `number_of_arms` and `minimum_age` have any), then scaled with `StandardScaler`.
+# - **Categorical features:** the 3 missing `masking` values are filled with the most common value, then one-hot encoded.
+# - The pipeline is fit on the training set only.
+
+# In[ ]:
+
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+
+num_features = ["total", "start_year", "us_site_share", "number_of_arms", "minimum_age", "maximum_age"]
+cat_features = ["cause_name", "phase", "agency_class", "gender", "allocation", "masking"]
+
+num_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler()),
+])
+cat_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("one-hot-encode", OneHotEncoder()),
+])
+full_pipeline = ColumnTransformer([
+    ("num", num_pipeline, num_features),
+    ("cat", cat_pipeline, cat_features),
+])
+
+X_train_clean = full_pipeline.fit_transform(X_train)
+X_train_clean = pd.DataFrame(X_train_clean.toarray(), columns=full_pipeline.get_feature_names_out())
+X_train_clean.head()
+
+
+# ### Analyze
+# Three models are compared using 10-fold cross-validation on the training set. The baseline is the standard deviation of the gap, which is about the RMSE you would get by always guessing the average gap.
+
+# In[ ]:
+
+
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import cross_val_score
+
+models = {
+    "Linear regression": LinearRegression(),
+    "Decision tree": DecisionTreeRegressor(random_state=42),
+    "Random forest": RandomForestRegressor(random_state=42),
+}
+
+results = []
+for name, model in models.items():
+    model.fit(X_train_clean, y_train)
+    train_rmse = np.sqrt(mean_squared_error(y_train, model.predict(X_train_clean)))
+    scores = cross_val_score(model, X_train_clean, y_train, cv=10, scoring="neg_mean_squared_error")
+    cv_rmse = np.sqrt(-scores)
+    results.append({"model": name, "train_rmse": train_rmse, "cv_rmse_mean": cv_rmse.mean(), "cv_rmse_std": cv_rmse.std()})
+
+print(f"Baseline (std of gap): {y_train.std():.1f}")
+pd.DataFrame(results).round(1)
+
+
+# - The decision tree fits the training set almost perfectly but has the worst cross-validation RMSE, so it's overfitting.
+# - Linear regression and the random forest both have a cross-validation RMSE of about 14.3, which beats the baseline of 18.6.
+# - The random forest is tuned next because `max_depth` and `min_samples_leaf` can limit overfitting.
+
+# In[ ]:
+
+
+from sklearn.model_selection import GridSearchCV
+
+param_grid = {
+    "max_depth": [5, 10, None],
+    "min_samples_leaf": [1, 5, 20],
+}
+grid_search = GridSearchCV(
+    RandomForestRegressor(random_state=42),
+    param_grid=param_grid,
+    cv=5,
+    scoring="neg_mean_squared_error",
+)
+grid_search.fit(X_train_clean, y_train)
+
+print(f"Best Params: {grid_search.best_params_}")
+print(f"CV RMSE: {np.sqrt(-grid_search.best_score_):.1f}")
+
+
+# ### Evaluate
+# The tuned random forest is checked once on the test set. The test set only goes through `transform`, never `fit`.
+
+# In[ ]:
+
+
+best_model = grid_search.best_estimator_
+
+X_test_clean = full_pipeline.transform(X_test)
+X_test_clean = pd.DataFrame(X_test_clean.toarray(), columns=full_pipeline.get_feature_names_out())
+
+test_rmse = np.sqrt(mean_squared_error(y_test, best_model.predict(X_test_clean)))
+baseline_rmse = np.sqrt(mean_squared_error(y_test, np.full(len(y_test), y_train.mean())))
+print(f"Test RMSE: {test_rmse:.1f}")
+print(f"Baseline RMSE (always guess the training average): {baseline_rmse:.1f}")
+
+
+# ### Share
+# - **Model choice:** the tuned random forest is chosen. Its test RMSE is about 13.4 points, compared with 17.5 for always guessing the average gap. It predicts better than guessing, but a typical prediction is still off by more than 10 points, so most of the variation between trials isn't explained by these features.
+# - **Sponsor:** sponsor type stands out the most. VA-sponsored trials enroll far fewer women than the conditions would suggest (about −35 points), which makes sense because most veterans are men.
+# - **Cause:** chronic kidney disease, Alzheimer's, stroke and COPD trials have the most negative gaps, matching the EDA charts.
+# - **Eligibility sex:** single-sex trials are at the extremes by design.
+# - **Little effect:** phase, masking, trial size and start year barely change the gap.
+# - **Limitations:**
+#   - Only trials that posted sex counts are included, and recent trials post less often.
+#   - Trials that match more than one cause appear more than once.
+#   - Prevalence comes from a model (GBD).
+#   - These are associations, not causes.
+
 # ## Resources and References
 # *What resources and references have you used for this project?*
 # 📝 <!-- Answer Below -->
 
-# In[98]:
+# In[99]:
 
 
 # ⚠️ Make sure you run this cell at the end of your notebook before every submission!
